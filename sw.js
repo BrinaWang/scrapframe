@@ -1,6 +1,7 @@
 // Scrapframe offline cache: app shell first, then whatever it loads (fonts, zip library).
-const CACHE = 'scrapframe-v6';
+const CACHE = 'scrapframe-v10';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png',
+  './brushpacks/packs.json',
   ...['black-card','newsprint-sheet','aged-grey','creased','crumpled','scrap-1','scrap-2','scrap-3'].map(n => './textures/' + n + '.webp'),
   'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'];
 self.addEventListener('install', e => {
