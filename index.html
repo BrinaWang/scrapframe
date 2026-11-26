@@ -75,7 +75,7 @@ select.sel{height:40px;border-radius:10px;border:1px solid var(--line);backgroun
 #ctxbar .opl{flex:none;display:flex;align-items:center;gap:8px;padding:0 8px;font-weight:500;white-space:nowrap}
 #ctxbar .opl input{width:110px;height:30px}
 #ctxbar select{flex:none;height:40px;border-radius:9px;border:1px solid var(--line);background:var(--chrome);padding:0 8px;font-size:15px}
-#grainOv{mix-blend-mode:soft-light;background-repeat:repeat}
+#grainOv{position:absolute;inset:0;mix-blend-mode:soft-light;background-repeat:repeat;transform-origin:50% 50%}
 #player{display:none;background:#fff}
 #ov{overflow:visible}
 #sliders{position:absolute;left:12px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:14px;padding:12px 8px;border-radius:22px;background:var(--chrome);box-shadow:var(--shadow);z-index:5}
@@ -263,8 +263,10 @@ details.adv[open] summary::after{content:"–"}
     <canvas id="cTape"></canvas>
     <canvas id="cOnion"></canvas>
     <canvas id="cStroke"></canvas>
-    <div id="grainOv"></div>
+    <div class="lay" id="grainWrap" style="overflow:hidden"><div id="grainOv"></div></div>
     <div class="lay" id="objFront"></div>
+    <canvas id="cScan" style="mix-blend-mode:soft-light"></canvas>
+    <canvas id="cDust"></canvas>
     <canvas id="player"></canvas>
     <svg id="ov" xmlns="http://www.w3.org/2000/svg"><g id="gSel"></g><g id="gTmp"></g><g id="gCur"></g></svg>
   </div>
@@ -845,7 +847,7 @@ function finishStroke(src, x0, y0, w, h, b, k) {
 }
 
 /* ============ state ============ */
-const P = { name: 'Untitled reel', w: 1440, h: 1080, fps: 12, paper: 'cold', grainOver: .45, grainBlend: 'soft-light', mediaOpacity: 1, mediaShow: true, customPaper: null, layers: [] };
+const P = { name: 'Untitled reel', w: 1440, h: 1080, fps: 12, paper: 'cold', grainOver: .45, grainBlend: 'soft-light', boil: { on: true, amt: .55, scan: true, scanAmt: .5, wobble: true }, mediaOpacity: 1, mediaShow: true, customPaper: null, layers: [] };
 const S = {
   tool: 'brush', brushId: 'pencil', color: '#1d1c1b', recent: [],
   eraser: { size: 40, opacity: 1 }, smudge: { size: 40, opacity: .7 }, streamline: .3,
@@ -859,7 +861,7 @@ let frames = [], cur = 0;
 const assets = new Map();          // id -> {blob,url,w,h}
 const customBrushes = [];          // brush objects with .tipBlob/.grainBlob
 const customStickers = [];         // {id, a: assetId}
-let BASE_C, TAPE_C, ONION_C, INK, STROKE, RAW, BACKUP, TMP;
+let BASE_C, TAPE_C, ONION_C, INK, STROKE, RAW, BACKUP, TMP, SCAN_C;
 const LAYER_C = new Map();
 const BLEND_OP = { normal: 'source-over', multiply: 'multiply', screen: 'screen', overlay: 'overlay', darken: 'darken', lighten: 'lighten' };
 const layerById = id => P.layers.find(l => l.id === id);
@@ -868,7 +870,7 @@ function newLayer(name) { return { id: uid(), name, visible: true, opacity: 1, b
 function applyLayerStyle(L) { const c = LAYER_C.get(L.id); if (!c) return; c.style.display = L.visible ? '' : 'none'; c.style.opacity = L.opacity; c.style.mixBlendMode = L.blend === 'normal' ? 'normal' : L.blend; }
 function buildLayerCanvases(resize) {
   if (!P.layers.length) P.layers = [newLayer('Layer 1')];
-  const st = $('#stage'), front = $('#grainOv');
+  const st = $('#stage'), front = $('#grainWrap');
   for (const [id, c] of [...LAYER_C]) if (!layerById(id)) { c.remove(); LAYER_C.delete(id); }
   for (const L of P.layers) {
     let c = LAYER_C.get(L.id);
@@ -979,21 +981,24 @@ async function setCustomPaper(blob) {
 function drawCover(c, img, W, H) { const iw = img.videoWidth || img.width, ih = img.videoHeight || img.height, s = Math.max(W / iw, H / ih); c.drawImage(img, (W - iw * s) / 2, (H - ih * s) / 2, iw * s, ih * s); }
 function drawContain(c, img, W, H) { const iw = img.videoWidth || img.width, ih = img.videoHeight || img.height, s = Math.min(W / iw, H / ih); c.drawImage(img, (W - iw * s) / 2, (H - ih * s) / 2, iw * s, ih * s); }
 function fullPaper() { const pi = paperCache.get(P.paper); return pi && pi.full ? pi : null; }
-function drawPaper(c) {
+function drawPaper(c, f = F()) {
   if (P.paper === 'none') return;
-  const fp = fullPaper(); if (fp) { c.drawImage(fp.img, 0, 0, P.w, P.h); return; }
+  const sh = sheetOf(f), fp = fullPaper();
+  if (fp) { c.save(); fullSheetXform(c, sh); c.drawImage(fp.img, 0, 0, P.w, P.h); c.restore(); sheetExtras(c, sh); return; }
   const def = currentPaperDef();
   if (def.src || def.gen || def.id === 'custom') { c.fillStyle = def.fallback || '#eeebe4'; c.fillRect(0, 0, P.w, P.h); return; }
-  c.fillStyle = c.createPattern(buildPaper(def).tile, 'repeat'); c.fillRect(0, 0, P.w, P.h);
+  c.fillStyle = sheetPattern(c, buildPaper(def).tile, sh); c.fillRect(0, 0, P.w, P.h);
+  sheetExtras(c, sh);
 }
-function drawGrainOver(c) {
+function drawGrainOver(c, f = F()) {
   if (P.paper === 'none' || P.grainOver <= 0) return;
   const def = currentPaperDef(), pi = fullPaper() || (def.src || def.gen || def.id === 'custom' ? null : buildPaper(def));
   const t = P.grainBlend === 'multiply' ? pi && pi.mul : pi && pi.rel;
   if (!t) return;
   c.save(); c.globalCompositeOperation = P.grainBlend || 'soft-light'; c.globalAlpha = P.grainOver;
-  if (pi.full) c.drawImage(t, 0, 0, P.w, P.h);
-  else { c.fillStyle = c.createPattern(t, 'repeat'); c.fillRect(0, 0, P.w, P.h); }
+  const sh = sheetOf(f);
+  if (pi.full) { fullSheetXform(c, sh); c.drawImage(t, 0, 0, P.w, P.h); }
+  else { c.fillStyle = sheetPattern(c, t, sh); c.fillRect(0, 0, P.w, P.h); }
   c.restore();
 }
 function applyPaperUI() {
@@ -1015,8 +1020,9 @@ async function renderBase() {
   const t = ++baseTok, f = F();
   const mb = (P.mediaShow && f.media) ? await frameBmp(f.media) : null;
   if (t !== baseTok) return;
-  const c = cx(BASE_C); c.clearRect(0, 0, P.w, P.h); drawPaper(c);
+  const c = cx(BASE_C); c.clearRect(0, 0, P.w, P.h); drawPaper(c, f);
   if (mb) { c.globalAlpha = P.mediaOpacity; c.drawImage(mb, 0, 0, P.w, P.h); c.globalAlpha = 1; }
+  applySheetUI(f);
 }
 let TAPE_TILE = null;
 function tapeTile() {
@@ -1117,7 +1123,7 @@ async function renderOnion() {
 /* flatten a frame for thumbnails, playback, export and sampling */
 async function renderFrame(c, f, sc, o = {}) {
   const { paper = true, media = P.mediaShow, grain = true, objects = true, tapes = true } = o;
-  const vis = P.layers.filter(L => L.visible);
+  const vis = o.layers === false ? [] : P.layers.filter(L => (L.visible || o.only === L.id) && (!o.only || L.id === o.only));
   let lives = null;
   if (f === F() && !o.useBlob) { lives = {}; const w = P.w * Math.min(1, sc), h = P.h * Math.min(1, sc); for (const L of vis) { const s = mk(w, h); cx(s).drawImage(LAYER_C.get(L.id), 0, 0, w, h); lives[L.id] = s; } }
   const mb = media && f.media ? await frameBmp(f.media) : null;
@@ -1126,16 +1132,18 @@ async function renderFrame(c, f, sc, o = {}) {
   const obs = [];
   if (objects) for (const ob of f.objects) { const A = assets.get(ob.a); if (A) obs.push([ob, await assetBmp(A.blob)]); }
   c.save(); c.scale(sc, sc);
-  if (paper) drawPaper(c);
+  if (o.wobble) wobbleXform(c, f);
+  if (paper) drawPaper(c, f);
   if (mb) { c.globalAlpha = P.mediaOpacity; c.drawImage(mb, 0, 0, P.w, P.h); c.globalAlpha = 1; }
   const dob = (ob, im) => { c.save(); c.translate(ob.x, ob.y); c.rotate(ob.r); c.scale(ob.fx, 1); c.globalAlpha = ob.op; c.globalCompositeOperation = BLEND_OP[ob.bl] || 'source-over'; objShadow(c, ob, sc); c.drawImage(im, -ob.w / 2, -ob.h / 2, ob.w, ob.h); c.restore(); };
   for (const [ob, im] of obs) if (ob.back) dob(ob, im);
   if (tapes) for (const t of f.tapes) drawTape(c, t, sc);
   for (const [L, s] of lsrc) { c.globalAlpha = L.opacity; c.globalCompositeOperation = BLEND_OP[L.blend] || 'source-over'; c.drawImage(s, 0, 0, P.w, P.h); }
   c.globalAlpha = 1; c.globalCompositeOperation = 'source-over';
-  if (paper && grain) drawGrainOver(c);
+  if (paper && grain) drawGrainOver(c, f);
   for (const [ob, im] of obs) if (!ob.back) dob(ob, im);
   c.restore();
+  if (paper && o.scan !== false) { c.save(); c.scale(sc, sc); drawScan(c, f); c.restore(); }
 }
 
 /* thumbnails */
@@ -1385,7 +1393,7 @@ async function serialize() {
   const used = new Set(); frames.forEach(f => f.objects.forEach(o => used.add(o.a)));
   const as = {}; for (const id of used) { const A = assets.get(id); if (A) as[id] = { k: add(A.blob), w: A.w, h: A.h }; }
   const man = {
-    app: 'scrapframe', v: 1, name: P.name, w: P.w, h: P.h, fps: P.fps, paper: P.paper, grainOver: P.grainOver, mediaOpacity: P.mediaOpacity, mediaShow: P.mediaShow,
+    app: 'scrapframe', v: 1, name: P.name, w: P.w, h: P.h, fps: P.fps, paper: P.paper, grainOver: P.grainOver, boil: P.boil, mediaOpacity: P.mediaOpacity, mediaShow: P.mediaShow,
     customPaper: add(P.customPaper), grainBlend: P.grainBlend, cur, assets: as, layers: P.layers, activeLayer: S.layer,
     frames: frames.map(f => { const inks = {}; for (const L of P.layers) { const k = add(f.inks[L.id]); if (k) inks[L.id] = k; } return { id: f.id, inks, media: add(f.media), objects: f.objects, tapes: f.tapes }; })
   };
@@ -1398,7 +1406,7 @@ async function deserialize({ man, blobs }) {
   assets.clear(); for (const k in stickerImgs) if (!STICKERS.some(s => s[0] === k)) delete stickerImgs[k];
   P.name = String(man.name || 'Untitled reel').slice(0, 80);
   P.w = clamp(num(man.w, 1440) | 0, 64, 4096); P.h = clamp(num(man.h, 1080) | 0, 64, 4096);
-  P.fps = clamp(num(man.fps, 12), 1, 60); P.grainOver = clamp(num(man.grainOver, .6), 0, 1); P.grainBlend = ['soft-light', 'overlay', 'multiply', 'hard-light'].includes(man.grainBlend) ? man.grainBlend : 'soft-light';
+  P.fps = clamp(num(man.fps, 12), 1, 60); P.grainOver = clamp(num(man.grainOver, .6), 0, 1); if (man.boil && typeof man.boil === 'object') P.boil = { on: man.boil.on !== false, amt: clamp(num(man.boil.amt, .55), 0, 1), scan: man.boil.scan !== false, scanAmt: clamp(num(man.boil.scanAmt, .5), 0, 1), wobble: man.boil.wobble !== false }; P.grainBlend = ['soft-light', 'overlay', 'multiply', 'hard-light'].includes(man.grainBlend) ? man.grainBlend : 'soft-light';
   P.mediaOpacity = clamp(num(man.mediaOpacity, 1), 0, 1); P.mediaShow = man.mediaShow !== false;
   P.paper = String(man.paper || 'cold');
   const B = k => (k && blobs[k] instanceof Blob) ? blobs[k] : null;
@@ -1496,20 +1504,29 @@ function needZip() {
 }
 const extOf = b => /png/.test(b.type) ? 'png' : /jpe?g/.test(b.type) ? 'jpg' : /webp/.test(b.type) ? 'webp' : 'bin';
 async function projectZip() {
-  const JSZip = await needZip(), { man, blobs } = await serialize(), z = new JSZip();
+  const { man, blobs } = await serialize(), z = new ZipWriter();
   man.files = {};
-  for (const k in blobs) { const fn = 'blobs/' + k + '.' + extOf(blobs[k]); man.files[k] = fn; z.file(fn, blobs[k]); }
-  z.file('manifest.json', JSON.stringify(man));
-  return z.generateAsync({ type: 'blob', compression: 'STORE' });
+  for (const k in blobs) { const fn = 'blobs/' + k + '.' + extOf(blobs[k]); man.files[k] = fn; await z.add(fn, blobs[k]); }
+  await z.add('manifest.json', new Blob([JSON.stringify(man)], { type: 'application/json' }));
+  return z.blob();
 }
 async function openProjectZip(file) {
-  const JSZip = await needZip(), z = await JSZip.loadAsync(file);
-  const mf = z.file('manifest.json'); if (!mf) throw new Error('This zip is not a Scrapframe project');
-  const man = JSON.parse(await mf.async('string')), blobs = {};
+  let entries = null;
+  try { entries = await readStoredZip(file); } catch (e) { entries = null; }
+  const get = async name => {
+    if (entries) { const b = entries.get(name); return b || null; }
+    return null;
+  };
+  if (!entries) {
+    const JSZip = await needZip(), z = await JSZip.loadAsync(file);
+    entries = new Map(); for (const n of Object.keys(z.files)) if (!z.files[n].dir) entries.set(n, new Blob([await z.files[n].async('arraybuffer')]));
+  }
+  const mf = await get('manifest.json'); if (!mf) throw new Error('This zip is not a Scrapframe project');
+  const man = JSON.parse(await mf.text()), blobs = {};
   for (const k in (man.files || {})) {
-    const e = z.file(String(man.files[k])); if (!e) continue;
-    const ext = String(man.files[k]).split('.').pop(), type = ext === 'png' ? 'image/png' : ext === 'jpg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : '';
-    blobs[k] = new Blob([await e.async('arraybuffer')], { type });
+    const nm = String(man.files[k]), b = await get(nm); if (!b) continue;
+    const ext = nm.split('.').pop(), type = ext === 'png' ? 'image/png' : ext === 'jpg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : '';
+    blobs[k] = new Blob([b], { type });
   }
   await deserialize({ man, blobs });
 }
@@ -1776,7 +1793,7 @@ function strokeAction(e) {
     STROKE.style.opacity = b.opacity * LY.opacity; STROKE.style.mixBlendMode = b.blend || 'normal';
   } else target = cx(INK);
   const st = new Stroke(target, b, mode === 'paint' && b.fixedColor ? b.fixedColor : S.color, { mode, size, flowMul, isPen, streamline: S.streamline, src: INK });
-  const pat = grain ? cx(STROKE).createPattern(grainMask(b.grainType, b.grain, b), 'repeat') : null;
+  const pat = grain ? (b.grainType === 'paper' ? sheetPattern(cx(STROKE), grainMask(b.grainType, b.grain, b), sheetOf(F()), true) : cx(STROKE).createPattern(grainMask(b.grainType, b.grain, b), 'repeat')) : null;
   DRAW.active = true; const t0 = performance.now();
   const flush = () => {
     grainRaf = 0; const d = st.dirty; if (!d || !grain) return; st.dirty = null;
@@ -2145,6 +2162,13 @@ function renderPaperPane() {
   <div class="seg" id="pBlend">${[['soft-light', 'Soft light'], ['overlay', 'Overlay'], ['multiply', 'Multiply'], ['hard-light', 'Hard light']].map(([v, l]) => `<button data-v="${v}" class="${P.grainBlend === v ? 'on' : ''}">${l}</button>`).join('')}</div>
   ${srow('Strength', 0, 1, .01, P.grainOver, pct, null, 'pGrain')}
   <p class="note">Soft light lets the paper's tooth show through paint and photos without dulling them. Multiply darkens the hollows, like ink settling.</p>
+  <h3>Printed & scanned</h3>
+  ${toggleRow('A new sheet of paper every frame', 'pBoil', P.boil.on)}
+  ${srow('Sheet-to-sheet variation', 0, 1, .01, P.boil.amt, pct, null, 'pBoilAmt')}
+  ${toggleRow('Scanner look: light, color drift, dust', 'pScan', P.boil.scan)}
+  ${srow('Scanner strength', 0, 1, .01, P.boil.scanAmt, pct, null, 'pScanAmt')}
+  ${toggleRow('Scan wobble in playback and export', 'pWob', P.boil.wobble)}
+  <p class="note">Each frame gets its own sheet (different grain, fibres and tone) and its own pass through the scanner, so the paper lives and breathes when it plays, like printed frames scanned one by one.</p>
   <h3>Imported media</h3>${toggleRow('Show photos and video frames', 'pMedia', P.mediaShow)}
   ${srow('Media opacity', 0, 1, .01, P.mediaOpacity, pct, null, 'pMediaOp')}
   <p class="note">Turn media down or off to trace over video (rotoscoping), then export just the drawings.</p>`;
@@ -2162,6 +2186,12 @@ function renderPaperPane() {
   $('#pBlend').onclick = e => { const b = e.target.closest('button'); if (!b) return; P.grainBlend = b.dataset.v; $$('#pBlend button').forEach(x => x.classList.toggle('on', x === b)); applyPaperUI(); bumpAll(); };
   bindRange('pMediaOp', pct, v => { P.mediaOpacity = v; renderBase(); bumpAll(); });
   $('#pMedia').onchange = e => { P.mediaShow = e.target.checked; renderBase(); bumpAll(); };
+  const boilCh = () => { sheetCache.clear(); scanCache.clear(); renderBase(); bumpAll(); markDirty(); };
+  $('#pBoil').onchange = e => { P.boil.on = e.target.checked; boilCh(); };
+  $('#pScan').onchange = e => { P.boil.scan = e.target.checked; boilCh(); };
+  $('#pWob').onchange = e => { P.boil.wobble = e.target.checked; bumpAll(); markDirty(); };
+  bindRange('pBoilAmt', pct, v => { P.boil.amt = v; clearTimeout(boilCh.t); boilCh.t = setTimeout(boilCh, 120); });
+  bindRange('pScanAmt', pct, v => { P.boil.scanAmt = v; clearTimeout(boilCh.t); boilCh.t = setTimeout(boilCh, 120); });
 }
 function bumpAll() { clearTimeout(bumpAll.t); bumpAll.t = setTimeout(() => { frames.forEach(f => { f.ver++; }); refreshThumbs(); markDirty(); }, 300); }
 async function refreshThumbs() { for (const f of frames.slice()) { await updateThumb(f); } updateTimeline(); }
@@ -2366,7 +2396,7 @@ async function buildFlats(maxSide, prog, opts = {}) {
     if (prog && prog.cancelled) return null;
     if (!(f.flat && f.flatKey === key && f.flatVer === f.ver)) {
       const c = mk(w, h), x = cx(c); x.fillStyle = '#fff'; x.fillRect(0, 0, w, h);
-      await renderFrame(x, f, sc, { useBlob: true, media: opts.media === false ? false : P.mediaShow });
+      await renderFrame(x, f, sc, { useBlob: true, media: opts.media === false ? false : P.mediaShow, wobble: P.boil.on && P.boil.wobble });
       f.flat = await toBlob(c, 'image/jpeg', .9); f.flatKey = key; f.flatVer = f.ver;
     }
     i++; if (prog) prog.set(i / frames.length, `Preparing frame ${i} of ${frames.length}`);
@@ -2597,50 +2627,6 @@ async function exportPNG() {
   await commitInk(); const c = mk(P.w, P.h); await renderFrame(cx(c), F(), 1, { useBlob: true });
   await deliver(await toBlob(c), `${safeName()}-frame-${String(cur + 1).padStart(3, '0')}.png`, 'image');
 }
-function pickMime() { if (!window.MediaRecorder) return null; for (const m of ['video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']) { try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (e) { } } return null; }
-async function exportVideo() {
-  const mime = pickMime();
-  if (!mime || !HTMLCanvasElement.prototype.captureStream) { await modal('Video export', '<p>This browser cannot record video from a canvas. Export a PNG sequence instead and assemble it in a video app.</p>'); return; }
-  const ans = await modal('Export animation', `
-    <div class="fld"><span>Size</span><select id="xs"><option value="1920">Up to 1920 px</option><option value="1280" selected>Up to 1280 px</option><option value="720">Up to 720 px</option></select></div>
-    <div class="fld"><span>Frame rate</span><select id="xf">${FPS.map(f => `<option ${f === P.fps ? 'selected' : ''}>${f}</option>`).join('')}</select></div>
-    <div class="fld"><span>Play through</span><select id="xl">${[1, 2, 3, 5, 10].map(n => `<option value="${n}" ${n === (frames.length < 12 ? 3 : 1) ? 'selected' : ''}>${n === 1 ? 'once' : n + ' times'}</option>`).join('')}</select></div>
-    ${toggleRow('Include imported photos and video', 'xm', P.mediaShow)}
-    <p class="note">Recording runs in real time (${frames.length} frames). Keep this screen open until it finishes.</p>`, [{ label: 'Cancel', value: null }, { label: 'Record video', value: 'go', primary: true }]);
-  if (ans !== 'go') return;
-  const maxS = +$('#xs').value, fps = +$('#xf').value, loops = +$('#xl').value, med = $('#xm').checked;
-  const prog = busyModal('Recording video');
-  const dims = await buildFlats(maxS, prog, { media: med }); if (!dims) { prog.done(); return; }
-  const W = dims.w & ~1, H = dims.h & ~1, rc = mk(W, H), rx = cx(rc), stream = rc.captureStream(fps);
-  const bmps = []; for (const f of frames) bmps.push(await decodeBlob(f.flat));
-  rx.drawImage(bmps[0], 0, 0, W, H);
-  let rec; try { rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8e6 }); } catch (e) { rec = new MediaRecorder(stream); }
-  const chunks = []; rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-  const stopped = new Promise(r => rec.onstop = r);
-  rec.start(250);
-  const total = frames.length * loops, track = stream.getVideoTracks()[0], start = performance.now();
-  for (let n = 0; n < total; n++) {
-    if (prog.cancelled) break;
-    rx.drawImage(bmps[n % frames.length], 0, 0, W, H); if (track && track.requestFrame) track.requestFrame();
-    prog.set((n + 1) / total, `Recording frame ${n + 1} of ${total}`);
-    const wait = start + (n + 1) * 1000 / fps - performance.now(); if (wait > 0) await sleep(wait);
-  }
-  rec.stop(); await stopped; prog.done();
-  if (prog.cancelled || !chunks.length) return;
-  const type = rec.mimeType || mime, blob = new Blob(chunks, { type }), ext = /mp4/.test(type) ? 'mp4' : 'webm';
-  await deliver(blob, `${safeName()}.${ext}`, 'video');
-}
-async function exportSeq() {
-  let JSZip; try { JSZip = await needZip(); } catch (e) { toast('PNG sequence needs the zip library, which could not load', 3500); return; }
-  const prog = busyModal('Exporting frames'); await commitInk(); const z = new JSZip();
-  for (let i = 0; i < frames.length; i++) {
-    if (prog.cancelled) { prog.done(); return; }
-    const c = mk(P.w, P.h); await renderFrame(cx(c), frames[i], 1, { useBlob: true }); z.file(`${safeName()}-${String(i + 1).padStart(4, '0')}.png`, await toBlob(c));
-    prog.set((i + 1) / frames.length, `Frame ${i + 1} of ${frames.length}`);
-  }
-  const blob = await z.generateAsync({ type: 'blob', compression: 'STORE' }); prog.done();
-  await deliver(blob, `${safeName()}-frames.zip`, 'zip');
-}
 async function newProject() {
   const sizes = [['1440x1080', '4:3 landscape (iPad)'], ['1920x1080', '16:9 landscape (video)'], ['1080x1080', 'Square'], ['1080x1440', '3:4 portrait'], ['1080x1920', '9:16 portrait (stories)']];
   const v = await modal('New project', `<p class="note">This replaces the reel saved on this iPad. Save a project file first if you want to keep it.</p>
@@ -2655,7 +2641,7 @@ function openMenu() {
   let m = $('#projMenu'); if (m) { m.remove(); return; }
   m = document.createElement('div'); m.className = 'menu'; m.id = 'projMenu';
   m.innerHTML = `<button data-a="new">${icon('plus')}New project…</button><button data-a="open">${icon('import')}Open project file…</button><button data-a="save">${icon('down')}Save project file (.zip)</button><hr>
-  <button data-a="png">${icon('paper')}Export this frame (PNG)</button><button data-a="video">${icon('play')}Export animation (video)</button><button data-a="seq">${icon('frame')}Export PNG sequence (.zip)</button><hr>
+  <button data-a="png">${icon('paper')}Export this frame (PNG)</button><button data-a="anim">${icon('play')}Export animation (MP4 or PNG sequence)…</button><hr>
   <button data-a="help">${icon('brush')}Gestures and tips</button>`;
   const r = $('#btnProject').getBoundingClientRect(); m.style.left = r.left + 'px'; m.style.top = (r.bottom + 6) + 'px';
   document.body.appendChild(m);
@@ -2666,8 +2652,7 @@ function openMenu() {
       if (b.dataset.a === 'open') $('#fileProject').click();
       if (b.dataset.a === 'save') { toast('Packing project…'); await deliver(await projectZip(), `${safeName()}.zip`, 'zip'); }
       if (b.dataset.a === 'png') await exportPNG();
-      if (b.dataset.a === 'video') await exportVideo();
-      if (b.dataset.a === 'seq') await exportSeq();
+      if (b.dataset.a === 'anim') await exportAnimation();
       if (b.dataset.a === 'help') helpModal();
     } catch (err) { toast(String(err && err.message || err), 4000); }
   };
@@ -2710,7 +2695,7 @@ document.addEventListener('keyup', e => { if (e.key === ' ') { spaceDown = false
 /* ============ init ============ */
 async function init() {
   paintIcons();
-  BASE_C = $('#cBase'); TAPE_C = $('#cTape'); ONION_C = $('#cOnion'); STROKE = $('#cStroke');
+  BASE_C = $('#cBase'); TAPE_C = $('#cTape'); ONION_C = $('#cOnion'); STROKE = $('#cStroke'); SCAN_C = $('#cScan');
   buildTips();
   $$('#rail [data-tool]').forEach(b => b.onclick = () => setTool(b.dataset.tool));
   paintSize = vslider($('#vsSize'), () => sizeTarget().size, v => sizeTarget().size = v, v => Math.log(v / SZ_MIN) / Math.log(SZ_MAX / SZ_MIN), t => Math.max(1, Math.round(SZ_MIN * Math.pow(SZ_MAX / SZ_MIN, t))), v => Math.round(v) + ' px');
@@ -3368,6 +3353,317 @@ function renderTornGrid() {
 
 /* ---------- boot ---------- */
 
+
+/* ================= export: frame-by-frame MP4 (WebCodecs + built-in muxer) and PNG sequences ================= */
+
+/* ---------- zip (store) writer/reader: no network needed ---------- */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8, c = 0xFFFFFFFF) { for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return c; }
+class ZipWriter {
+  constructor() { this.parts = []; this.dir = []; this.off = 0; }
+  async add(name, blob) {
+    const nm = new TextEncoder().encode(name), data = new Uint8Array(await blob.arrayBuffer()), crc = (crc32(data) ^ 0xFFFFFFFF) >>> 0, n = data.length;
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true); h.setUint16(10, 0, true); h.setUint16(12, 0x21, true);
+    h.setUint32(14, crc, true); h.setUint32(18, n, true); h.setUint32(22, n, true); h.setUint16(26, nm.length, true); h.setUint16(28, 0, true);
+    this.parts.push(h.buffer, nm, blob); this.dir.push({ nm, crc, n, off: this.off }); this.off += 30 + nm.length + n;
+  }
+  blob() {
+    const cd = []; let size = 0;
+    for (const e of this.dir) {
+      const h = new DataView(new ArrayBuffer(46));
+      h.setUint32(0, 0x02014b50, true); h.setUint16(4, 20, true); h.setUint16(6, 20, true); h.setUint16(8, 0x0800, true); h.setUint16(10, 0, true); h.setUint16(12, 0, true); h.setUint16(14, 0x21, true);
+      h.setUint32(16, e.crc, true); h.setUint32(20, e.n, true); h.setUint32(24, e.n, true); h.setUint16(28, e.nm.length, true); h.setUint32(42, e.off, true);
+      cd.push(h.buffer, e.nm); size += 46 + e.nm.length;
+    }
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, this.dir.length, true); end.setUint16(10, this.dir.length, true); end.setUint32(12, size, true); end.setUint32(16, this.off, true);
+    return new Blob([...this.parts, ...cd, end.buffer], { type: 'application/zip' });
+  }
+}
+async function readStoredZip(file) {
+  const tail = new DataView(await file.slice(Math.max(0, file.size - 65557)).arrayBuffer());
+  let p = -1; for (let i = tail.byteLength - 22; i >= 0; i--) if (tail.getUint32(i, true) === 0x06054b50) { p = i; break; }
+  if (p < 0) throw new Error('not a zip');
+  const count = tail.getUint16(p + 10, true), cdSize = tail.getUint32(p + 12, true), cdOff = tail.getUint32(p + 16, true);
+  const cd = new DataView(await file.slice(cdOff, cdOff + cdSize).arrayBuffer()), out = new Map(); let q = 0;
+  for (let i = 0; i < count; i++) {
+    if (cd.getUint32(q, true) !== 0x02014b50) throw new Error('bad zip');
+    const method = cd.getUint16(q + 10, true), csize = cd.getUint32(q + 20, true), nl = cd.getUint16(q + 28, true), xl = cd.getUint16(q + 30, true), cl = cd.getUint16(q + 32, true), off = cd.getUint32(q + 42, true);
+    const name = new TextDecoder().decode(new Uint8Array(cd.buffer, q + 46, nl));
+    if (method !== 0) throw new Error('compressed');
+    const lh = new DataView(await file.slice(off, off + 30).arrayBuffer()), start = off + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+    if (!name.endsWith('/')) out.set(name, file.slice(start, start + csize));
+    q += 46 + nl + xl + cl;
+  }
+  return out;
+}
+
+/* ---------- minimal MP4 (ISO-BMFF) muxer for one H.264 track ---------- */
+function mp4Mux({ width, height, fps, avcC, samples }) {
+  const enc = new TextEncoder(), TS = 90000, dur = Math.round(TS / fps);
+  const u32 = v => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0); return b; };
+  const u16 = v => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v); return b; };
+  const u8 = v => new Uint8Array([v]);
+  const cat = parts => { let n = 0; for (const p of parts) n += p.length; const o = new Uint8Array(n); let k = 0; for (const p of parts) { o.set(p, k); k += p.length; } return o; };
+  const box = (type, ...kids) => { const body = cat(kids); return cat([u32(body.length + 8), enc.encode(type), body]); };
+  const full = (type, v, flags, ...kids) => box(type, u8(v), u8(flags >> 16 & 255), u8(flags >> 8 & 255), u8(flags & 255), ...kids);
+  const zeros = n => new Uint8Array(n);
+  const matrix = cat([u32(0x10000), u32(0), u32(0), u32(0), u32(0x10000), u32(0), u32(0), u32(0), u32(0x40000000)]);
+  const n = samples.length, total = n * dur, ms = Math.round(total / TS * 1000);
+  const build = mdatOffset => {
+    const stsd = full('stsd', 0, 0, u32(1), box('avc1', zeros(6), u16(1), zeros(16), u16(width), u16(height), u32(0x00480000), u32(0x00480000), u32(0), u16(1), zeros(32), u16(0x18), u16(0xffff), box('avcC', new Uint8Array(avcC))));
+    const stts = full('stts', 0, 0, u32(1), u32(n), u32(dur));
+    const keys = samples.map((s, i) => s.key ? i + 1 : 0).filter(Boolean);
+    const stss = full('stss', 0, 0, u32(keys.length), ...keys.map(u32));
+    const stsc = full('stsc', 0, 0, u32(1), u32(1), u32(n), u32(1));
+    const stsz = full('stsz', 0, 0, u32(0), u32(n), ...samples.map(s => u32(s.data.length)));
+    const stco = full('stco', 0, 0, u32(1), u32(mdatOffset));
+    const stbl = box('stbl', stsd, stts, stss, stsc, stsz, stco);
+    const minf = box('minf', full('vmhd', 0, 1, zeros(8)), box('dinf', full('dref', 0, 0, u32(1), full('url ', 0, 1))), stbl);
+    const mdia = box('mdia', full('mdhd', 0, 0, u32(0), u32(0), u32(TS), u32(total), u16(0x55c4), u16(0)), full('hdlr', 0, 0, u32(0), enc.encode('vide'), zeros(12), enc.encode('Scrapframe video\0')), minf);
+    const tkhd = full('tkhd', 0, 3, u32(0), u32(0), u32(1), u32(0), u32(ms), zeros(8), u16(0), u16(0), u16(0), u16(0), matrix, u32(width << 16), u32(height << 16));
+    const mvhd = full('mvhd', 0, 0, u32(0), u32(0), u32(1000), u32(ms), u32(0x10000), u16(0x100), zeros(10), matrix, zeros(24), u32(2));
+    return box('moov', mvhd, box('trak', tkhd, mdia));
+  };
+  const ftyp = box('ftyp', enc.encode('isom'), u32(512), enc.encode('isom'), enc.encode('iso2'), enc.encode('avc1'), enc.encode('mp41'));
+  let moov = build(0); const off = ftyp.length + moov.length + 8; moov = build(off);
+  let dataLen = 0; for (const s of samples) dataLen += s.data.length;
+  return new Blob([ftyp, moov, u32(dataLen + 8), enc.encode('mdat'), ...samples.map(s => s.data)], { type: 'video/mp4' });
+}
+async function pickAvc(w, h, fps) {
+  if (!('VideoEncoder' in window)) return null;
+  const br = Math.round(clamp(w * h * fps * .18, 2e6, 24e6));
+  for (const codec of ['avc1.640033', 'avc1.640028', 'avc1.4d0033', 'avc1.4d0028', 'avc1.42e033', 'avc1.42e028', 'avc1.42e01f']) {
+    const cfg = { codec, width: w, height: h, bitrate: br, framerate: fps, avc: { format: 'avc' } };
+    try { const r = await VideoEncoder.isConfigSupported(cfg); if (r && r.supported) return r.config || cfg; } catch (e) { }
+  }
+  return null;
+}
+
+/* ---------- render one frame for export ---------- */
+async function exportFrameCanvas(f, sc, inc, only) {
+  const w = Math.round(P.w * sc) & ~1, h = Math.round(P.h * sc) & ~1, c = mk(w, h), x = cx(c);
+  if (inc.solid) { x.fillStyle = inc.solid; x.fillRect(0, 0, w, h); }
+  await renderFrame(x, f, w / P.w, { useBlob: true, paper: inc.paper, media: inc.media, objects: inc.objects, tapes: inc.objects, grain: inc.paper && inc.grain, layers: inc.layers !== false, only, wobble: P.boil.on && P.boil.wobble, scan: !only });
+  return c;
+}
+
+/* ---------- export dialog ---------- */
+async function exportAnimation() {
+  await commitInk();
+  const N = frames.length, vis = P.layers.filter(L => L.visible);
+  const sizes = [[1, `Full (${P.w} × ${P.h})`], [1080 / Math.max(P.w, P.h) < 1 ? 1080 / Math.max(P.w, P.h) : 1, 'Up to 1080 px'], [720 / Math.max(P.w, P.h) < 1 ? 720 / Math.max(P.w, P.h) : 1, 'Up to 720 px'], [.5, 'Half size']];
+  const canMp4 = 'VideoEncoder' in window;
+  const st = { fmt: canMp4 ? 'mp4' : 'png', split: false };
+  const v = await modal('Export animation', `
+    <div class="seg" id="exFmt"><button data-v="mp4" class="${st.fmt === 'mp4' ? 'on' : ''}">MP4 video</button><button data-v="png" class="${st.fmt === 'png' ? 'on' : ''}">PNG sequence (.zip)</button></div>
+    <p class="note" id="exFmtNote">${canMp4 ? 'Every frame is rendered from your layers and encoded straight to H.264. Nothing is played back or recorded, so it is exact and faster than real time.' : 'This browser cannot encode MP4 here (on iPad it needs iPadOS 16.4 or later). PNG sequences work everywhere.'}</p>
+    <div class="fld"><span>Frames</span><span style="color:var(--muted)" id="exRangeTxt">1 – ${N}</span></div>
+    ${srow('From frame', 1, N, 1, 1, v => v, null, 'exFrom')}${srow('To frame', 1, N, 1, N, v => v, null, 'exTo')}
+    <div class="fld"><span>Size</span><select id="exSize">${sizes.map(([k, l], i) => `<option value="${k}" ${i === (Math.max(P.w, P.h) > 1920 ? 1 : 0) ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    <div class="fld" id="exFpsRow"><span>Frame rate</span><select id="exFps">${FPS.map(f => `<option ${f === P.fps ? 'selected' : ''}>${f}</option>`).join('')}</select></div>
+    <div class="fld" id="exLoopRow"><span>Play through</span><select id="exLoop">${[1, 2, 3, 5, 10].map(n => `<option value="${n}" ${n === (N < 12 ? 3 : 1) ? 'selected' : ''}>${n === 1 ? 'once' : n + ' times'}</option>`).join('')}</select></div>
+    <h3 style="margin:14px 0 6px;font-size:15px">Layers</h3>
+    <div class="seg" id="exSplit"><button data-v="0" class="on">All layers combined</button><button data-v="1">Each layer separately</button></div>
+    <p class="note" id="exSplitNote">Uses the ${vis.length} visible layer${vis.length === 1 ? '' : 's'} with their opacity and blend modes.</p>
+    <h3 style="margin:14px 0 6px;font-size:15px">Include</h3>
+    ${toggleRow('Paper / background', 'exPaper', P.paper !== 'none')}${toggleRow('Paper texture over artwork', 'exGrain', true)}${toggleRow('Imported photos and video', 'exMedia', P.mediaShow)}${toggleRow('Collage pieces, stickers, tape and overlays', 'exObj', true)}
+    <p class="note">PNGs keep transparency wherever the paper is turned off. MP4 has no transparency, so empty areas become white.</p>`,
+    [{ label: 'Cancel', value: null }, { label: 'Export', value: 'go', primary: true }], {
+    onOpen: b => {
+      const sync = () => {
+        $('#exFmt', b).querySelectorAll('button').forEach(x => x.classList.toggle('on', x.dataset.v === st.fmt));
+        $('#exSplit', b).querySelectorAll('button').forEach(x => x.classList.toggle('on', (x.dataset.v === '1') === st.split));
+        $('#exLoopRow', b).style.display = st.fmt === 'mp4' ? '' : 'none';
+        $('#exSplitNote', b).textContent = st.split
+          ? `A folder of transparent PNGs for each of the ${vis.length} visible layers, plus a "background" folder for paper, photos and pieces.${st.fmt === 'mp4' ? ' Each layer becomes its own MP4 (on white), all in one zip.' : ''}`
+          : `Uses the ${vis.length} visible layer${vis.length === 1 ? '' : 's'} with their opacity and blend modes.`;
+      };
+      $('#exFmt', b).onclick = e => { const x = e.target.closest('button'); if (!x) return; if (x.dataset.v === 'mp4' && !canMp4) { toast('MP4 encoding is not available in this browser'); return; } st.fmt = x.dataset.v; sync(); };
+      $('#exSplit', b).onclick = e => { const x = e.target.closest('button'); if (!x) return; st.split = x.dataset.v === '1'; sync(); };
+      const rng2 = () => { let a = +$('#exFrom').value, z = +$('#exTo').value; if (a > z) { if (document.activeElement && document.activeElement.id === 'exFrom') { $('#exTo').value = a; z = a; $('#exToo').textContent = a; } else { $('#exFrom').value = z; a = z; $('#exFromo').textContent = z; } } $('#exRangeTxt').textContent = `${a} – ${z} (${z - a + 1} frame${z - a ? 's' : ''})`; };
+      bindRange('exFrom', v2 => v2, rng2); bindRange('exTo', v2 => v2, rng2); rng2(); sync();
+    }
+  });
+  if (v !== 'go') return;
+  const from = +$('#exFrom').value - 1, to = +$('#exTo').value - 1, sc = +$('#exSize').value, fps = +$('#exFps').value, loops = +$('#exLoop').value;
+  const inc = { paper: $('#exPaper').checked, grain: $('#exGrain').checked, media: $('#exMedia').checked, objects: $('#exObj').checked };
+  const list = frames.slice(Math.min(from, to), Math.max(from, to) + 1);
+  try {
+    if (st.fmt === 'png') await exportPngSeq(list, sc, inc, st.split);
+    else await exportMp4(list, sc, inc, st.split, fps, loops);
+  } catch (err) { toast('Export failed: ' + (err && err.message || err), 5000); }
+}
+const pad4 = n => String(n).padStart(4, '0');
+const safeLayer = n => String(n).replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-').toLowerCase() || 'layer';
+async function exportPngSeq(list, sc, inc, split) {
+  const prog = busyModal('Exporting PNG sequence'), z = new ZipWriter(), base = safeName();
+  const jobs = [];
+  if (!split) jobs.push([null, '', inc]);
+  else {
+    const vis = P.layers.filter(L => L.visible), used = new Set();
+    for (const L of vis.slice().reverse()) { let nm = safeLayer(L.name); while (used.has(nm)) nm += '-2'; used.add(nm); jobs.push([L.id, nm + '/', { paper: false, grain: false, media: false, objects: false }]); }
+    if (inc.paper || inc.media || inc.objects) jobs.push([null, 'background/', Object.assign({}, inc, { layers: false })]);
+  }
+  const total = jobs.length * list.length; let k = 0;
+  for (const [only, dir, opt] of jobs) for (let i = 0; i < list.length; i++) {
+    if (prog.cancelled) { prog.done(); return; }
+    const c = await exportFrameCanvas(list[i], sc, opt, only);
+    await z.add(`${dir}${base}-${pad4(i + 1)}.png`, await toBlob(c));
+    prog.set(++k / total, `${dir ? dir.slice(0, -1) + ': ' : ''}frame ${i + 1} of ${list.length}`);
+    if (k % 4 === 0) await nextFrame();
+  }
+  prog.set(1, 'Packing…'); const blob = z.blob(); prog.done();
+  await deliver(blob, `${base}-png-sequence.zip`, 'zip');
+}
+async function encodeMp4(list, sc, opt, only, fps, loops, prog, label, k0, total) {
+  const w = Math.round(P.w * sc) & ~1, h = Math.round(P.h * sc) & ~1;
+  const cfg = await pickAvc(w, h, fps); if (!cfg) throw new Error(`MP4 (H.264) at ${w}×${h} is not supported here. Try a smaller size or PNG sequence.`);
+  const samples = []; let avcC = null, encErr = null;
+  const enc = new VideoEncoder({
+    output: (chunk, meta) => {
+      const d = new Uint8Array(chunk.byteLength); chunk.copyTo(d); samples.push({ data: d, key: chunk.type === 'key' });
+      const desc = meta && meta.decoderConfig && meta.decoderConfig.description;
+      if (desc && !avcC) avcC = desc instanceof ArrayBuffer ? new Uint8Array(desc.slice(0)) : new Uint8Array(desc.buffer.slice(desc.byteOffset, desc.byteOffset + desc.byteLength));
+    },
+    error: e2 => { encErr = e2; }
+  });
+  enc.configure(Object.assign({}, cfg, { latencyMode: 'quality' }));
+  const n = list.length * loops, step = 1e6 / fps, gop = Math.max(1, Math.round(fps * 2)), kept = [];
+  for (let j = 0; j < n && !prog.cancelled && !encErr; j++) {
+    const i = j % list.length; let src;
+    if (j < list.length) { src = await exportFrameCanvas(list[i], sc, Object.assign({ solid: '#ffffff' }, opt), only); if (loops > 1) kept[i] = await toBlob(src, 'image/jpeg', .95); }
+    else src = await decodeBlob(kept[i]);
+    const fr = new VideoFrame(src, { timestamp: Math.round(j * step), duration: Math.round(step) });
+    enc.encode(fr, { keyFrame: j % gop === 0 }); fr.close(); if (src.close) src.close();
+    while (enc.encodeQueueSize > 4) await sleep(2);
+    prog.set((k0 + (j + 1) / n * list.length) / total, `${label}frame ${i + 1} of ${list.length}${loops > 1 ? ` (pass ${Math.floor(j / list.length) + 1} of ${loops})` : ''}`);
+  }
+  if (!encErr) await enc.flush(); try { enc.close(); } catch (e3) { }
+  if (encErr) throw encErr;
+  if (prog.cancelled) return null;
+  if (!avcC || !samples.length) throw new Error('The encoder produced no video');
+  return mp4Mux({ width: w, height: h, fps, avcC, samples });
+}
+async function exportMp4(list, sc, inc, split, fps, loops) {
+  const prog = busyModal('Exporting MP4'), base = safeName();
+  try {
+    if (!split) {
+      const blob = await encodeMp4(list, sc, inc, null, fps, loops, prog, '', 0, list.length);
+      prog.done(); if (blob) await deliver(blob, `${base}.mp4`, 'video'); return;
+    }
+    const z = new ZipWriter(), vis = P.layers.filter(L => L.visible).slice().reverse(), jobs = vis.map(L => [L.id, safeLayer(L.name), { paper: false, grain: false, media: false, objects: false }]);
+    if (inc.paper || inc.media || inc.objects) jobs.push([null, 'background', Object.assign({}, inc, { layers: false })]);
+    const total = jobs.length * list.length; let k = 0;
+    for (const [only, nm, opt] of jobs) {
+      const blob = await encodeMp4(list, sc, opt, only, fps, loops, prog, nm + ': ', k, total); if (!blob) { prog.done(); return; }
+      await z.add(`${base}-${nm}.mp4`, blob); k += list.length;
+    }
+    prog.done(); await deliver(z.blob(), `${base}-layers-mp4.zip`, 'zip');
+  } catch (e) { prog.done(); throw e; }
+}
+
+/* ================= printed & scanned: every frame is its own sheet, scanned on its own pass ================= */
+function strHash(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+const sheetCache = new Map();
+function sheetOf(f) {
+  if (!f || !P.boil || !P.boil.on) return null;
+  const key = f.id + '|' + P.boil.amt; if (sheetCache.has(key)) return sheetCache.get(key);
+  const seed = strHash(f.id), R = rng(seed), a = P.boil.amt, g = () => (R() + R() + R()) / 1.5 - 1; // soft bell curve in [-1,1]
+  const s = {
+    seed,
+    dx: Math.floor(R() * 512), dy: Math.floor(R() * 512),               // a different patch of the same paper stock
+    zoom: 1.06 + (.06 + R() * .28) * a, orient: 0, fx: 1, fy: 1,
+    ox: g(), oy: g(),
+    tone: g(), warm: g(), tint: R(), lightA: R() * Math.PI * 2, light: .35 + R() * .65,
+    crease: R() < .12 * a * 2, creaseA: R() * Math.PI, creaseP: .2 + R() * .6,
+    stain: R() < .08 * a * 2, wob: { x: g(), y: g(), r: g() }
+  };
+  // a different way up on the glass: never the same orientation as the frame before it
+  const idx = frames.indexOf(f), prev = idx > 0 ? sheetOf(frames[idx - 1]) : null, prevO = prev ? prev.orient : -1;
+  let o = (R() * 4) | 0; if (a > .2 && o === prevO) o = (o + 1 + ((R() * 3) | 0)) % 4;
+  s.orient = a > .2 ? o : 0; s.fx = s.orient & 1 ? -1 : 1; s.fy = s.orient & 2 ? -1 : 1;
+  if (sheetCache.size > 400) sheetCache.clear();
+  sheetCache.set(key, s); return s;
+}
+/* tile papers: same stock, different patch */
+function sheetPattern(c, tile, s, grainOnly) {
+  const p = c.createPattern(tile, 'repeat');
+  if (s && p.setTransform && window.DOMMatrix) { try { p.setTransform(new DOMMatrix().translate(s.dx, s.dy)); } catch (e) { } }
+  return p;
+}
+/* full-sheet papers (scans, generated): a slightly different crop and orientation of the sheet */
+function fullSheetXform(c, s) {
+  if (!s) return; const W = P.w, H = P.h, z = s.zoom, mx = (z - 1) / z * W / 2 * .9, my = (z - 1) / z * H / 2 * .9;
+  c.translate(W / 2, H / 2); c.scale(z * s.fx, z * s.fy); c.translate(-W / 2 + s.ox * mx, -H / 2 + s.oy * my);
+}
+/* things that belong to one sheet only: its batch tone, loose fibres, the odd crease or mark */
+function sheetExtras(c, s) {
+  if (!s) return; const W = P.w, H = P.h, a = P.boil.amt, R = rng(s.seed + 11), m = Math.max(W, H);
+  c.save();
+  const tints = ['255,236,205', '236,236,230', '240,232,214', '226,232,236'];
+  c.globalCompositeOperation = 'multiply'; c.fillStyle = `rgba(${tints[(s.tint * 4) | 0]},${.16 * a})`; c.fillRect(0, 0, W, H);
+  c.globalCompositeOperation = 'source-over';
+  // soft unevenness in the sheet itself: two or three faint clouds
+  for (let i = 0; i < 3; i++) { const X = R() * W, Y = R() * H, r = m * (.2 + R() * .35), g = c.createRadialGradient(X, Y, 0, X, Y, r), dark = R() < .6; g.addColorStop(0, dark ? `rgba(90,80,60,${.035 * a})` : `rgba(255,255,250,${.05 * a})`); g.addColorStop(1, 'rgba(0,0,0,0)'); c.fillStyle = g; c.fillRect(0, 0, W, H); }
+  // fibres and inclusions
+  const nf = Math.round((18 + R() * 40) * a);
+  for (let i = 0; i < nf; i++) {
+    const X = R() * W, Y = R() * H, L = 3 + R() ** 2 * 26, ang = R() * 6.28, dark = R() < .55;
+    c.strokeStyle = dark ? `rgba(70,60,45,${.08 + R() * .16})` : `rgba(255,255,255,${.2 + R() * .3})`; c.lineWidth = .4 + R() * .8;
+    c.beginPath(); c.moveTo(X, Y); c.quadraticCurveTo(X + Math.cos(ang + .7) * L / 2, Y + Math.sin(ang + .7) * L / 2, X + Math.cos(ang) * L, Y + Math.sin(ang) * L); c.stroke();
+  }
+  for (let i = 0; i < Math.round(30 * a); i++) { c.fillStyle = `rgba(60,50,40,${.1 + R() * .3})`; c.beginPath(); c.arc(R() * W, R() * H, .3 + R() ** 3 * 1.4, 0, 7); c.fill(); }
+  if (s.crease) {
+    const ca = s.creaseA, px = W * s.creaseP, py = H * (1 - s.creaseP), dx = Math.cos(ca) * m, dy = Math.sin(ca) * m, nx = -Math.sin(ca), ny = Math.cos(ca);
+    for (const [o, col] of [[-1.2, `rgba(255,255,255,${.35 * a})`], [1.2, `rgba(0,0,0,${.16 * a})`]]) { c.strokeStyle = col; c.lineWidth = 1.4; c.beginPath(); c.moveTo(px - dx + nx * o, py - dy + ny * o); for (let t = -1; t <= 1; t += .05) c.lineTo(px + dx * t + nx * o + (R() - .5) * 1.2, py + dy * t + ny * o + (R() - .5) * 1.2); c.stroke(); }
+  }
+  if (s.stain) { const X = R() * W, Y = R() * H, r = m * (.03 + R() * .06), g = c.createRadialGradient(X, Y, r * .6, X, Y, r); g.addColorStop(0, `rgba(170,130,70,${.05 * a})`); g.addColorStop(.85, `rgba(150,105,50,${.12 * a})`); g.addColorStop(1, 'rgba(150,105,50,0)'); c.fillStyle = g; c.beginPath(); c.arc(X, Y, r, 0, 7); c.fill(); }
+  c.restore();
+}
+/* the scanner: exposure, white balance, uneven lamp (as a neutral-grey soft-light layer) + dust and hairs on the glass */
+const scanCache = new Map();
+function scanLayers(f) {
+  const s = sheetOf(f); if (!s || !P.boil.scan) return null;
+  const key = f.id + '|' + P.boil.scanAmt + '|' + P.w + 'x' + P.h; if (scanCache.has(key)) return scanCache.get(key);
+  const W = P.w, H = P.h, k = P.boil.scanAmt, m = Math.max(W, H), R = rng(s.seed + 97);
+  const tw = Math.max(8, Math.round(W / 4)), th = Math.max(8, Math.round(H / 4)), tone = mk(tw, th), t = cx(tone);
+  const base = 128 + s.tone * 10 * k, wr = s.warm * 8 * k;
+  t.fillStyle = `rgb(${clamp(base + wr, 0, 255)},${clamp(base + wr * .3, 0, 255)},${clamp(base - wr, 0, 255)})`; t.fillRect(0, 0, tw, th);
+  const ax = Math.cos(s.lightA), ay = Math.sin(s.lightA), g = t.createLinearGradient(tw / 2 - ax * tw * .7, th / 2 - ay * th * .7, tw / 2 + ax * tw * .7, th / 2 + ay * th * .7);
+  g.addColorStop(0, `rgba(0,0,0,${.22 * k * s.light})`); g.addColorStop(.55, 'rgba(0,0,0,0)'); g.addColorStop(1, `rgba(255,255,255,${.08 * k})`);
+  t.fillStyle = g; t.fillRect(0, 0, tw, th);
+  const dust = mk(W, H), d = cx(dust), nd = Math.round((6 + R() * 28) * k);
+  for (let i = 0; i < nd; i++) { const light = R() < .25; d.fillStyle = light ? `rgba(255,255,255,${.4 + R() * .5})` : `rgba(25,22,20,${.25 + R() * .5})`; d.beginPath(); d.arc(R() * W, R() * H, Math.max(.35, R() ** 3 * 2.2), 0, 7); d.fill(); }
+  const nh = R() < .55 * k + .1 ? 1 + ((R() * 2.2 * k) | 0) : 0;
+  for (let i = 0; i < nh; i++) { d.strokeStyle = `rgba(25,22,20,${.25 + R() * .3})`; d.lineWidth = .5 + R() * .5; d.beginPath(); const X = R() * W, Y = R() * H, L = m * (.01 + R() * .03); d.moveTo(X, Y); d.bezierCurveTo(X + (R() - .5) * L, Y + (R() - .5) * L, X + (R() - .5) * L * 1.5, Y + (R() - .5) * L * 1.5, X + (R() - .5) * L * 2, Y + (R() - .5) * L * 2); d.stroke(); }
+  const out = { tone, dust };
+  if (scanCache.size > 8) scanCache.delete(scanCache.keys().next().value);
+  scanCache.set(key, out); return out;
+}
+function drawScan(c, f) {
+  const L = scanLayers(f); if (!L) return;
+  c.save(); c.globalCompositeOperation = 'soft-light'; c.drawImage(L.tone, 0, 0, P.w, P.h); c.globalCompositeOperation = 'source-over'; c.drawImage(L.dust, 0, 0, P.w, P.h); c.restore();
+}
+/* the print sits a little differently on the glass each time */
+function wobbleXform(c, f) {
+  const s = sheetOf(f); if (!s || !P.boil.wobble) return;
+  const W = P.w, H = P.h, a = Math.max(.25, P.boil.amt), dx = s.wob.x * W * .0035 * a, dy = s.wob.y * H * .0035 * a, r = s.wob.r * .0035 * a;
+  const z = 1 + (Math.abs(dx) / W + Math.abs(dy) / H) * 2 + Math.abs(r) * 1.6;
+  c.translate(W / 2, H / 2); c.rotate(r); c.scale(z, z); c.translate(-W / 2 + dx, -H / 2 + dy);
+}
+/* keep the live canvas in step: overlay tooth follows the sheet, scanner layer redrawn */
+function applySheetUI(f = F()) {
+  const g = $('#grainOv'); if (!g) return;
+  const s = sheetOf(f), full = !!fullPaper();
+  if (!s) { g.style.backgroundPosition = '0 0'; g.style.transform = ''; }
+  else if (full) { const W = P.w, H = P.h, z = s.zoom, mx = (z - 1) / z * W / 2 * .9, my = (z - 1) / z * H / 2 * .9; g.style.backgroundPosition = '0 0'; g.style.transform = `scale(${z * s.fx},${z * s.fy}) translate(${s.ox * mx}px,${s.oy * my}px)`; }
+  else { g.style.transform = ''; g.style.backgroundPosition = `${s.dx}px ${s.dy}px`; }
+  const L = P.paper !== 'none' ? scanLayers(f) : null, tc = $('#cScan'), dc = $('#cDust');
+  tc.hidden = dc.hidden = !L;
+  if (L) { if (tc.width !== L.tone.width || tc.height !== L.tone.height) { tc.width = L.tone.width; tc.height = L.tone.height; } cx(tc).drawImage(L.tone, 0, 0); if (dc.width !== P.w || dc.height !== P.h) { dc.width = P.w; dc.height = P.h; } const x = cx(dc); x.clearRect(0, 0, P.w, P.h); x.drawImage(L.dust, 0, 0); }
+}
 
 /* ================= textures: your scans, generated surfaces, street stickers ================= */
 const TEX = {
